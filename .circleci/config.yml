@@ -1,0 +1,199 @@
+# Simple colcon build and deploy
+version: 2.1
+
+orbs: 
+  aws-s3: circleci/aws-s3@3.0.0
+  colcon_build-orb: cmrobotics/colcon_build-orb@0.2.1
+  openvpn3: versatile/openvpn3@1.0.19
+
+workflows:
+  on_commit:
+    build, test and create:
+      jobs:
+        - validate_merge
+        - merge_and_push:
+            filters:
+              tags:
+                ignore: /^[0-9]+\.[0-9]+\.[0-9]+$/
+        - build-test:
+            filters:
+              tags:
+                ignore: /^[0-9]+\.[0-9]+\.[0-9]+$/
+            context:
+              - ROS Pipelines
+              - OpenVPN
+        - create:
+            requires:
+              - build-test
+            context:
+              - ROS Pipelines
+              - OpenVPN
+    build, test, create and deploy:
+      jobs:
+        - validate_merge
+        - merge_and_push:
+            filters:
+              branches:
+                ignore: /.*/
+              tags:
+                only: /^[0-9]+\.[0-9]+\.[0-9]+$/
+        - build-test:
+            filters:
+              branches:
+                ignore: /.*/
+              tags:
+                only: /^[0-9]+\.[0-9]+\.[0-9]+$/
+            context:
+              - ROS Pipelines
+              - OpenVPN
+        - create:
+            filters:
+              branches:
+                ignore: /.*/
+              tags:
+                only: /^[0-9]+\.[0-9]+\.[0-9]+$/
+            requires:
+              - build-test
+            context:
+              - ROS Pipelines
+              - OpenVPN
+        - deploy:
+            filters:
+              branches:
+                ignore: /.*/
+              tags:
+                only: /^[0-9]+\.[0-9]+\.[0-9]+$/
+            requires:
+              - build-test
+              - create
+            context:
+              - AWS ECR Access
+  nightly:
+    triggers:
+      - schedule:
+          cron: "0 8 * * *"
+          filters:
+            branches:
+              only: galactic-devel
+    jobs:
+      - validate_merge
+      - merge_and_push:
+          filters:
+            branches:
+              only: galactic-devel
+
+executors:
+  simple-machine:
+    machine: 
+      image: ubuntu-2004:202111-02
+    working_directory: ~/workspace/src/<package_name> 
+  simple-docker:
+    docker:
+      - image: osrf/ros:galactic-desktop-focal
+    working_directory: ~/workspace/src/<package_name> 
+jobs:
+  validate_merge:
+    docker:
+      - image: ubuntu:focal
+    steps:
+      - checkout
+      - run:
+          name: Install dependencies
+          command: |
+            apt update -y
+            apt install git -y
+      - run:
+          name: Validate that it is possible to sync with the upstream repo
+          command: |
+            # Make sure to purge all the password as soon as possible and only store them in memory
+            git config credential.helper 'cache --timeout=120'
+            git config user.email "91249588+LotzBot@users.noreply.github.com"
+            git config user.name "LotzBot"
+            git remote add upstream https://github.com/Box-Robotics/ros2_numpy.git
+            git fetch upstream foxy-devel
+            git checkout -b update/bot-updating
+            git merge --commit --no-edit upstream/foxy-devel
+  merge_and_push:
+    docker:
+      - image: ubuntu:focal
+    steps:
+      - checkout
+      - run:
+          name: Install dependencies
+          command: |
+            apt update -y
+            apt install git -y
+      - run:
+          name: Sync with the upstream repo and push
+          command: |
+            # Make sure to purge all the password as soon as possible and only store them in memory
+            git config credential.helper 'cache --timeout=120'
+            git config user.email "91249588+LotzBot@users.noreply.github.com"
+            git config user.name "LotzBot"
+            git remote add upstream https://github.com/Box-Robotics/ros2_numpy.git
+            git fetch upstream foxy-devel
+            git checkout -b update/bot-updating
+            git merge --commit --no-edit --strategy-option ours upstream/foxy-devel
+            # Push quitely to prevent showing the token in the log
+            git push -q https://${GITHUB_BOT_TOKEN}@github.com/cmrobotics/ros2_numpy.git ${CIRCLE_BRANCH}
+  build-test:
+    executor: simple-machine
+    steps:
+      - checkout:
+          path: ~/workspace/src/$CIRCLE_PROJECT_REPONAME
+      - openvpn3/install
+      - openvpn3/connect:
+        config: VPN_CLIENT_CONFIG
+      - openvpn3/check
+      - colcon_build-orb/docker_run:
+          rosdistro_url: ROSDISTRO_INDEX_URL
+          github_token: GITHUB_TOKEN
+          circle_project_repo: CIRCLE_PROJECT_REPONAME
+          workspace_volume: /home/circleci/workspace:/root/workspace
+      - colcon_build-orb/colcon_build
+      - openvpn3/disconnect
+      - persist_to_workspace:
+          root: ../..
+          paths: 
+            - .
+  create:
+    executor: simple-machine
+    steps: 
+      - attach_workspace:
+          at: ~/workspace
+      - openvpn3/install
+      - openvpn3/connect:
+        config: VPN_CLIENT_CONFIG
+      - openvpn3/check
+      - colcon_build-orb/docker_run:
+          rosdistro_url: ROSDISTRO_INDEX_URL
+          github_token: GITHUB_TOKEN
+          circle_project_repo: CIRCLE_PROJECT_REPONAME
+          workspace_volume: /home/circleci/workspace:/root/workspace
+      - colcon_build-orb/binarize
+      - openvpn3/disconnect
+      - store_artifacts:
+          path: ~/workspace/src/ros-galactic-<package_name>.deb 
+      - persist_to_workspace:
+          root: ~/workspace
+          paths: 
+            - src/ros-galactic-<package_name>.deb 
+  deploy:
+    executor: simple-docker
+    steps:
+      - attach_workspace:
+          at: ~/workspace
+      - run:
+          name: Renaming with tag name
+          command: mv ~/workspace/src/ros-galactic-$CIRCLE_PROJECT_REPONAME.deb ~/workspace/src/ros-galactic-$CIRCLE_PROJECT_REPONAME-$CIRCLE_TAG.deb
+      - run:
+          name: Install unzip
+          command: apt update && apt install -y unzip
+      - aws-s3/copy:
+          arguments: |
+            --acl private 
+          aws-access-key-id: AWS_ACCESS_KEY_ID
+          aws-region: AWS_REGION
+          aws-secret-access-key: AWS_SECRET_ACCESS_KEY
+          from: ~/workspace/src/ros-galactic-$CIRCLE_PROJECT_REPONAME-$CIRCLE_TAG.deb
+          to: 's3://aptly-debian-files/ros-galactic-$CIRCLE_PROJECT_REPONAME.deb'

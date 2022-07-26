@@ -9,7 +9,10 @@ orbs:
 workflows:
   build, test and create:
     jobs:
-      - validate_merge
+      - validate_merge:
+          filters:
+            tags:
+              ignore: /^[0-9]+\.[0-9]+\.[0-9]+$/
       - merge_and_push:
           filters:
             tags:
@@ -29,7 +32,12 @@ workflows:
             - OpenVPN
   build, test, create and deploy:
     jobs:
-      - validate_merge
+      - validate_merge:
+          filters:
+            branches:
+              ignore: /.*/
+            tags:
+              only: /^[0-9]+\.[0-9]+\.[0-9]+$/
       - merge_and_push:
           filters:
             branches:
